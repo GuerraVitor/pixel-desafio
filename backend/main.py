@@ -1,48 +1,18 @@
-from functools import lru_cache
 from typing import Annotated
 
 import boto3
-import redis
 from botocore.client import Config
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import text
 
-
-class Settings(BaseSettings):
-    app_env: str = "development"
-    database_url: str = "postgresql+psycopg2://pixel:pixel@localhost:5432/pixel_breeders"
-    redis_url: str = "redis://localhost:6379/0"
-    minio_endpoint: str = "localhost:9000"
-    minio_public_endpoint: str = "localhost:9000"
-    minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin"
-    minio_bucket: str = "pixel-files"
-    minio_secure: bool = False
-    jwt_secret_key: str = "change-me-in-development"
-    jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 60
-    cors_origins: str = "http://localhost:5173,http://localhost:3000"
-
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
-
-    @property
-    def cors_origin_list(self) -> list[str]:
-        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
-
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
+from config import get_settings
+from database import Base, DbSession, RedisClient, engine
+import models
+from routers.auth import router as auth_router
 
 settings = get_settings()
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
 minio_client = boto3.client(
     "s3",
     endpoint_url=f"{'https' if settings.minio_secure else 'http'}://{settings.minio_endpoint}",
@@ -67,25 +37,13 @@ app.add_middleware(
 )
 
 
-def get_db() -> Session:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def get_redis() -> redis.Redis:
-    return redis_client
-
-
 def get_minio():
     return minio_client
 
 
-DbSession = Annotated[Session, Depends(get_db)]
-RedisClient = Annotated[redis.Redis, Depends(get_redis)]
 MinioClient = Annotated[object, Depends(get_minio)]
+
+app.include_router(auth_router)
 
 
 @app.get("/")
@@ -108,6 +66,11 @@ def dependency_health(
     cache.ping()
     storage.head_bucket(Bucket=settings.minio_bucket)
     return {"database": "ok", "redis": "ok", "minio": "ok"}
+
+
+@app.on_event("startup")
+def create_database_tables() -> None:
+    Base.metadata.create_all(bind=engine)
 
 
 @app.on_event("startup")
