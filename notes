@@ -1,0 +1,1574 @@
+# Pixel Breeders File Manager - Notes de Estudo
+
+Este arquivo e o caderno tecnico do projeto. A cada passo implementado, ele deve ser atualizado com:
+
+- o que foi construido;
+- quais bibliotecas, frameworks e ferramentas foram usados;
+- por que cada decisao tecnica foi tomada;
+- como testar a etapa;
+- conceitos teoricos envolvidos;
+- detalhes praticos de como o codigo funciona.
+
+## Visao Geral do Projeto
+
+O Pixel Breeders File Manager e uma aplicacao full-stack para gerenciamento de arquivos por usuario. A aplicacao tera cadastro, login, upload, download, delecao, versionamento de arquivos, links temporarios, cache e frontend web.
+
+A stack definida e:
+
+- Backend: FastAPI com Python.
+- Frontend: React, TypeScript, Vite e TailwindCSS.
+- Banco de dados: PostgreSQL.
+- Storage de arquivos: MinIO, compativel com S3.
+- Cache: Redis.
+- Infraestrutura local: Docker e Docker Compose.
+
+A ideia arquitetural e separar responsabilidades:
+
+- PostgreSQL guarda dados estruturados, como usuarios e metadados dos arquivos.
+- MinIO guarda o conteudo binario real dos arquivos.
+- Redis guarda dados temporarios e cache.
+- FastAPI expoe a API HTTP.
+- React consome a API e fornece a interface de usuario.
+
+## Passo 1 - Infraestrutura e Backend Base
+
+### O que foi implementado
+
+Foram criados:
+
+- `docker-compose.yml`, orquestrando os containers principais.
+- `backend/Dockerfile`, definindo como construir a imagem do backend.
+- `backend/requirements.txt`, listando dependencias Python.
+- `backend/main.py`, criando a aplicacao FastAPI inicial.
+
+O objetivo do Passo 1 foi permitir que a API subisse localmente com:
+
+```bash
+docker compose up -d --build postgres redis minio backend
+```
+
+Depois disso, o Swagger deve estar disponivel em:
+
+```text
+http://localhost:8000/docs
+```
+
+### Docker
+
+Docker permite empacotar aplicacoes e dependencias em containers.
+
+Neste projeto, usamos um container para cada servico:
+
+- `postgres`: banco relacional.
+- `redis`: cache em memoria.
+- `minio`: storage de arquivos.
+- `backend`: API FastAPI.
+- `frontend`: reservado para o frontend, que sera concluido em etapa futura.
+
+### Docker Compose
+
+Docker Compose e usado para declarar varios containers em um unico arquivo YAML. Em vez de iniciar container por container manualmente, declaramos servicos, portas, variaveis de ambiente, volumes e dependencias em `docker-compose.yml`.
+
+Exemplo conceitual:
+
+```yaml
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+```
+
+Isso diz que o servico `backend` sera construido a partir da pasta `./backend` e vai expor a porta `8000`.
+
+### PostgreSQL
+
+PostgreSQL e o banco de dados relacional do projeto.
+
+Ele sera usado para armazenar:
+
+- usuarios;
+- senhas com hash;
+- metadados dos arquivos;
+- versoes dos arquivos;
+- flags como `is_deleted`.
+
+No Compose:
+
+```yaml
+POSTGRES_DB: pixel_breeders
+POSTGRES_USER: pixel
+POSTGRES_PASSWORD: pixel
+```
+
+Essas variaveis criam o banco inicial e o usuario de desenvolvimento.
+
+A porta:
+
+```yaml
+"5432:5432"
+```
+
+expoe o PostgreSQL localmente na porta padrao `5432`.
+
+### Redis
+
+Redis e um banco em memoria, muito usado como cache.
+
+Neste projeto, ele sera usado em passo futuro para cachear a listagem de arquivos do usuario:
+
+```text
+GET /files
+```
+
+Cache significa guardar temporariamente uma resposta pronta para evitar trabalho repetido. Por exemplo: se o usuario chama a listagem duas vezes seguidas e nada mudou, podemos devolver a resposta do Redis em vez de consultar o PostgreSQL novamente.
+
+No Compose, o Redis esta exposto em:
+
+```yaml
+"6379:6379"
+```
+
+### MinIO
+
+MinIO e um storage de objetos compativel com a API do Amazon S3.
+
+Storage de objetos e diferente de banco relacional. Ele e ideal para guardar arquivos binarios, como:
+
+- imagens;
+- PDFs;
+- textos;
+- uploads em geral.
+
+Neste projeto, o backend nao deve salvar arquivos no filesystem local. O arquivo real vai para o MinIO, e o PostgreSQL guarda apenas metadados, como nome, tamanho, tipo MIME e chave do objeto.
+
+Portas:
+
+- `9000`: API S3 usada pelo backend.
+- `9001`: painel web do MinIO.
+
+Credenciais locais:
+
+```text
+usuario: minioadmin
+senha: minioadmin
+```
+
+### Volumes
+
+Volumes Docker persistem dados mesmo se o container for removido.
+
+No projeto:
+
+- `postgres_data`: guarda dados do PostgreSQL.
+- `redis_data`: guarda dados persistidos do Redis.
+- `minio_data`: guarda arquivos enviados ao MinIO.
+
+Sem volumes, os dados poderiam ser perdidos ao recriar containers.
+
+### Healthcheck
+
+Healthcheck e uma verificacao feita pelo Docker para saber se um servico esta pronto.
+
+Exemplo:
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U pixel -d pixel_breeders"]
+```
+
+Isso evita que o backend tente iniciar antes do banco estar aceitando conexoes.
+
+### FastAPI
+
+FastAPI e um framework Python para criar APIs HTTP.
+
+Vantagens:
+
+- rapido;
+- baseado em type hints do Python;
+- gera documentacao Swagger automaticamente;
+- integra bem com Pydantic;
+- suporta async e streaming, importantes para upload/download.
+
+No `main.py`, a aplicacao e criada com:
+
+```python
+app = FastAPI(...)
+```
+
+Rotas sao criadas com decorators:
+
+```python
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+```
+
+### Uvicorn
+
+Uvicorn e o servidor ASGI usado para rodar FastAPI.
+
+No Dockerfile, o comando final e:
+
+```dockerfile
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+```
+
+Isso significa:
+
+- `main:app`: arquivo `main.py`, variavel `app`.
+- `--host 0.0.0.0`: permite acesso de fora do container.
+- `--port 8000`: porta da API.
+- `--reload`: reinicia automaticamente quando arquivos mudam, util em desenvolvimento.
+
+### CORS
+
+CORS significa Cross-Origin Resource Sharing.
+
+Quando o frontend roda em uma porta diferente da API, por exemplo:
+
+- frontend: `http://localhost:5173`
+- backend: `http://localhost:8000`
+
+o navegador considera que sao origens diferentes. Para permitir que o frontend chame a API, configuramos CORS no backend:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+## Passo 2 - Banco de Dados e Autenticacao
+
+### O que foi implementado
+
+Foram criados/modificados:
+
+- `backend/config.py`
+- `backend/database.py`
+- `backend/models.py`
+- `backend/schemas.py`
+- `backend/security.py`
+- `backend/routers/auth.py`
+- `backend/main.py`
+- `backend/requirements.txt`
+
+Funcionalidades entregues:
+
+- configuracao centralizada por variaveis de ambiente;
+- conexao SQLAlchemy com PostgreSQL;
+- modelos `User` e `File`;
+- cadastro de usuario;
+- login de usuario;
+- geracao de JWT;
+- validacao de Bearer Token;
+- rota protegida `GET /auth/me`.
+
+### Configuracao com Pydantic Settings
+
+O arquivo `backend/config.py` centraliza configuracoes da aplicacao.
+
+Foi usada a biblioteca:
+
+```text
+pydantic-settings
+```
+
+Ela permite declarar uma classe com os campos esperados:
+
+```python
+class Settings(BaseSettings):
+    database_url: str
+    redis_url: str
+    jwt_secret_key: str
+```
+
+Esses valores podem vir de variaveis de ambiente, como no `docker-compose.yml`:
+
+```yaml
+DATABASE_URL: postgresql+psycopg2://pixel:pixel@postgres:5432/pixel_breeders
+```
+
+Vantagens:
+
+- evita espalhar strings de configuracao pelo codigo;
+- facilita trocar configuracoes entre desenvolvimento e producao;
+- permite validar tipos, como `int`, `bool` e `str`.
+
+### SQLAlchemy
+
+SQLAlchemy e uma biblioteca Python para trabalhar com banco de dados relacional.
+
+Ela pode ser usada de duas formas principais:
+
+- SQL Expression Language: criando queries mais proximas de SQL.
+- ORM: mapeando classes Python para tabelas do banco.
+
+Neste projeto usamos ORM.
+
+ORM significa Object-Relational Mapping. A ideia e representar tabelas como classes Python.
+
+Exemplo:
+
+```python
+class User(Base):
+    __tablename__ = "users"
+
+    id = mapped_column(...)
+    email = mapped_column(...)
+```
+
+Essa classe representa uma tabela chamada `users`.
+
+### Engine
+
+No `backend/database.py`, criamos:
+
+```python
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+```
+
+`engine` e o objeto central de conexao com o banco.
+
+Ele sabe:
+
+- qual banco usar;
+- qual driver usar;
+- host;
+- usuario;
+- senha;
+- database.
+
+`pool_pre_ping=True` ajuda a evitar erro com conexoes antigas ou derrubadas, porque o SQLAlchemy testa a conexao antes de reutiliza-la.
+
+### Session
+
+Tambem criamos:
+
+```python
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+```
+
+Session e a unidade de trabalho com o banco. Ela e usada para:
+
+- buscar registros;
+- adicionar objetos;
+- fazer commit;
+- fazer rollback;
+- fechar conexao.
+
+No FastAPI, criamos uma dependencia:
+
+```python
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+Isso garante que cada requisicao receba uma sessao e que ela seja fechada no final.
+
+### Declarative Base
+
+Em SQLAlchemy moderno, usamos:
+
+```python
+class Base(DeclarativeBase):
+    pass
+```
+
+Todos os modelos herdam de `Base`. Assim, o SQLAlchemy conhece todas as tabelas mapeadas.
+
+No startup da aplicacao:
+
+```python
+Base.metadata.create_all(bind=engine)
+```
+
+Isso cria as tabelas que ainda nao existem.
+
+Observacao: para projetos maiores, o ideal e usar Alembic para migrations. Nesta etapa, `create_all` e suficiente porque o foco e deixar cada passo testavel isoladamente.
+
+### Modelo User
+
+O modelo `User` representa usuarios da aplicacao.
+
+Campos:
+
+- `id`: identificador unico em UUID.
+- `email`: email unico, usado para login.
+- `password_hash`: senha protegida por hash.
+- `created_at`: data de criacao.
+
+Conceitos importantes:
+
+- Nunca salvar senha em texto puro.
+- Email tem indice e constraint unica para evitar duplicidade.
+- UUID evita expor IDs sequenciais simples.
+
+### Modelo File
+
+O modelo `File` representa metadados de arquivos.
+
+Campos:
+
+- `id`: identificador unico do registro.
+- `user_id`: dono do arquivo.
+- `original_name`: nome original enviado pelo usuario.
+- `minio_key`: chave do objeto no MinIO.
+- `mime_type`: tipo do arquivo, como `image/png` ou `application/pdf`.
+- `size`: tamanho em bytes.
+- `version`: versao do arquivo.
+- `is_deleted`: flag para exclusao logica.
+- `created_at`: data de upload/criacao.
+
+O conteudo real do arquivo nao fica no PostgreSQL. Ele ficara no MinIO.
+
+### Relacionamento User -> File
+
+Um usuario pode ter muitos arquivos.
+
+No SQLAlchemy:
+
+```python
+files = relationship(back_populates="user")
+```
+
+No `File`:
+
+```python
+user = relationship(back_populates="files")
+```
+
+Esse relacionamento permite navegar entre usuario e arquivos no codigo Python.
+
+### Constraint de versionamento
+
+No modelo `File`, existe uma constraint:
+
+```python
+UniqueConstraint("user_id", "original_name", "version", name="uq_user_file_version")
+```
+
+Ela impede que o mesmo usuario tenha duas linhas com o mesmo nome original e a mesma versao.
+
+Exemplo valido:
+
+```text
+user_id=1, original_name=contrato.pdf, version=1
+user_id=1, original_name=contrato.pdf, version=2
+```
+
+Exemplo invalido:
+
+```text
+user_id=1, original_name=contrato.pdf, version=1
+user_id=1, original_name=contrato.pdf, version=1
+```
+
+### Schemas Pydantic
+
+O arquivo `backend/schemas.py` define schemas de entrada e saida da API.
+
+Pydantic valida dados automaticamente.
+
+Exemplo:
+
+```python
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+```
+
+Isso garante:
+
+- email valido;
+- senha com no minimo 8 caracteres;
+- senha com no maximo 128 caracteres.
+
+Se o usuario enviar dados invalidos, FastAPI retorna `422 Validation Error`.
+
+### EmailStr e email-validator
+
+`EmailStr` e um tipo do Pydantic para validar email.
+
+Para funcionar, ele precisa da biblioteca:
+
+```text
+email-validator
+```
+
+Por isso ela foi adicionada ao `requirements.txt`.
+
+### Hash de Senha
+
+Senha nao deve ser salva em texto puro.
+
+Em vez disso, salvamos um hash:
+
+```python
+password_hash = hash_password(payload.password)
+```
+
+Hash e uma transformacao de mao unica. A aplicacao consegue verificar se uma senha bate com o hash, mas nao deve conseguir recuperar a senha original.
+
+Bibliotecas usadas:
+
+- `passlib`: interface para hashing de senhas.
+- `bcrypt`: algoritmo/backend de hash.
+
+Configuracao:
+
+```python
+password_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+```
+
+### Por que bcrypt foi fixado em 4.0.1
+
+Durante o teste do cadastro, ocorreu erro `500` no endpoint:
+
+```text
+POST /auth/register
+```
+
+O traceback mostrou que o problema acontecia em:
+
+```python
+password_context.hash(password)
+```
+
+A causa foi incompatibilidade entre:
+
+```text
+passlib==1.7.4
+```
+
+e versoes novas do pacote:
+
+```text
+bcrypt
+```
+
+Mesmo com senha curta, o `passlib` executa verificacoes internas usando entradas maiores, e a versao nova do `bcrypt` pode levantar:
+
+```text
+ValueError: password cannot be longer than 72 bytes
+```
+
+Para estabilizar o ambiente, fixamos:
+
+```text
+bcrypt==4.0.1
+```
+
+Depois de alterar dependencias, e necessario reconstruir a imagem:
+
+```bash
+docker compose down
+docker compose build --no-cache backend
+docker compose up -d postgres redis minio backend
+```
+
+### JWT
+
+JWT significa JSON Web Token.
+
+Ele e um token assinado que carrega informacoes em JSON.
+
+No projeto, o token carrega o `sub`, que significa subject. Aqui, `sub` e o `id` do usuario.
+
+Exemplo conceitual de payload:
+
+```json
+{
+  "sub": "id-do-usuario",
+  "exp": "data-de-expiracao"
+}
+```
+
+O backend assina o token usando:
+
+```text
+JWT_SECRET_KEY
+```
+
+e algoritmo:
+
+```text
+HS256
+```
+
+### Criacao do token
+
+No `backend/security.py`:
+
+```python
+def create_access_token(subject: str, expires_delta: timedelta | None = None) -> str:
+    expires_at = datetime.now(timezone.utc) + (...)
+    payload = {"sub": subject, "exp": expires_at}
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+```
+
+O token expira depois do tempo configurado em:
+
+```text
+ACCESS_TOKEN_EXPIRE_MINUTES
+```
+
+No ambiente local, esta configurado como:
+
+```text
+60 minutos
+```
+
+### Bearer Token
+
+Bearer Token e uma forma comum de autenticar chamadas HTTP.
+
+O cliente envia o token no header:
+
+```http
+Authorization: Bearer SEU_TOKEN
+```
+
+O backend le esse header, valida o JWT e identifica o usuario.
+
+### Dependencia de usuario autenticado
+
+No `backend/security.py`, existe:
+
+```python
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+```
+
+Isso ensina o FastAPI a procurar o token Bearer no header `Authorization`.
+
+Depois:
+
+```python
+def get_current_user(db: DbSession, token: str = Depends(oauth2_scheme)) -> User:
+```
+
+Essa funcao:
+
+1. recebe o token;
+2. decodifica o JWT;
+3. pega o `sub`;
+4. busca o usuario no banco;
+5. retorna o usuario se tudo estiver valido;
+6. retorna `401` se algo estiver errado.
+
+Essa funcao sera reaproveitada em rotas futuras para garantir isolamento por usuario.
+
+### Rotas de autenticacao
+
+As rotas ficam em:
+
+```text
+backend/routers/auth.py
+```
+
+Foi usado:
+
+```python
+router = APIRouter(prefix="/auth", tags=["auth"])
+```
+
+Isso significa que todas as rotas desse arquivo comecam com `/auth`.
+
+#### POST /auth/register
+
+Cria um usuario.
+
+Entrada:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "stringst"
+}
+```
+
+Fluxo:
+
+1. valida o payload com Pydantic;
+2. normaliza email para lowercase;
+3. gera hash da senha;
+4. cria objeto `User`;
+5. adiciona na sessao do banco;
+6. executa `commit`;
+7. retorna JWT e dados do usuario.
+
+Se email ja existir, retorna:
+
+```text
+409 Conflict
+```
+
+#### POST /auth/login
+
+Autentica usuario com JSON.
+
+Entrada:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "stringst"
+}
+```
+
+Fluxo:
+
+1. busca usuario pelo email;
+2. verifica senha com bcrypt/passlib;
+3. se valido, retorna JWT;
+4. se invalido, retorna `401 Unauthorized`.
+
+Essa rota e pratica para o frontend React.
+
+#### POST /auth/token
+
+Autentica usuario usando formulario OAuth2.
+
+Essa rota existe para compatibilidade com o fluxo do Swagger/FastAPI.
+
+Ela recebe:
+
+- `username`
+- `password`
+
+Mesmo usando o campo `username`, no nosso caso ele representa o email.
+
+#### GET /auth/me
+
+Rota protegida para testar autenticao.
+
+Ela exige:
+
+```http
+Authorization: Bearer SEU_TOKEN
+```
+
+Se o token for valido, retorna:
+
+```json
+{
+  "id": "...",
+  "email": "user@example.com",
+  "created_at": "..."
+}
+```
+
+Se nao houver token ou ele for invalido, retorna:
+
+```text
+401 Unauthorized
+```
+
+### Codigos HTTP usados
+
+Principais status desta etapa:
+
+- `201 Created`: usuario criado com sucesso.
+- `200 OK`: login ou consulta realizada com sucesso.
+- `401 Unauthorized`: credenciais invalidas ou token ausente/invalido.
+- `409 Conflict`: email ja cadastrado.
+- `422 Validation Error`: payload invalido.
+- `500 Internal Server Error`: erro nao tratado no backend.
+
+### Como testar o Passo 2
+
+Subir servicos:
+
+```bash
+docker compose up -d --build postgres redis minio backend
+```
+
+Abrir Swagger:
+
+```text
+http://localhost:8000/docs
+```
+
+Criar usuario:
+
+```text
+POST /auth/register
+```
+
+Payload:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "stringst"
+}
+```
+
+Fazer login:
+
+```text
+POST /auth/login
+```
+
+Copiar `access_token`.
+
+No Swagger, clicar em `Authorize` e preencher:
+
+```text
+Bearer SEU_TOKEN
+```
+
+Testar:
+
+```text
+GET /auth/me
+```
+
+Resultado esperado:
+
+- com token valido: `200`;
+- sem token: `401`.
+
+### Como ler logs do backend
+
+Quando o Swagger mostra apenas:
+
+```text
+500 Internal Server Error
+```
+
+o detalhe real fica nos logs do container:
+
+```bash
+docker compose logs --tail=200 backend
+```
+
+Para acompanhar em tempo real:
+
+```bash
+docker compose logs -f backend
+```
+
+Esse foi o metodo usado para encontrar a causa real do erro no hash da senha.
+
+## Politica para proximos passos
+
+A partir daqui, todo passo implementado deve atualizar este arquivo.
+
+Formato recomendado para cada nova etapa:
+
+1. O que foi implementado.
+2. Arquivos criados/modificados.
+3. Bibliotecas e frameworks usados.
+4. Conceitos teoricos.
+5. Fluxo pratico da funcionalidade.
+6. Como testar.
+7. Erros encontrados e como foram resolvidos.
+
+## Passo 3 - Integracao MinIO e Upload/Download
+
+### O que foi implementado
+
+Neste passo foram implementadas as funcionalidades de armazenamento de arquivos:
+
+- configuracao centralizada do cliente MinIO/S3;
+- upload autenticado em `POST /upload`;
+- validacao de extensao e tipo MIME;
+- limite de tamanho de 10MB;
+- leitura do upload em chunks;
+- registro dos metadados no PostgreSQL usando o modelo `File`;
+- versionamento automatico quando o mesmo usuario envia arquivo com o mesmo nome;
+- download protegido em `GET /download/{file_id}` usando `StreamingResponse`;
+- link temporario em `GET /share/{file_id}` usando presigned URL do MinIO.
+
+Arquivos criados/modificados:
+
+- `backend/storage.py`
+- `backend/routers/files.py`
+- `backend/schemas.py`
+- `backend/main.py`
+
+Importante: este passo nao implementa listagem de arquivos, cache Redis ou delete. Essas funcionalidades pertencem ao Passo 4.
+
+### Por que o conteudo do arquivo vai para o MinIO
+
+Arquivos binarios nao devem ser salvos diretamente no PostgreSQL neste projeto.
+
+O PostgreSQL e excelente para dados estruturados:
+
+- usuarios;
+- nomes de arquivos;
+- tamanhos;
+- tipos MIME;
+- versoes;
+- dono do arquivo;
+- datas.
+
+Mas o conteudo real do arquivo pode ser grande e e melhor armazenado em um storage de objetos, como MinIO ou S3.
+
+Por isso o fluxo escolhido e:
+
+1. O usuario envia o arquivo para a API.
+2. A API valida o arquivo.
+3. A API envia o conteudo binario para o MinIO.
+4. A API salva no PostgreSQL apenas os metadados e a chave do objeto no MinIO.
+
+Essa chave e o campo:
+
+```text
+minio_key
+```
+
+Ela funciona como o "caminho" do objeto dentro do bucket.
+
+### S3 e MinIO
+
+S3 e um servico da AWS para armazenamento de objetos.
+
+MinIO e uma alternativa open-source compativel com a API do S3. Isso significa que bibliotecas feitas para S3, como `boto3`, tambem conseguem conversar com MinIO.
+
+Conceitos principais:
+
+- Bucket: recipiente onde objetos sao guardados.
+- Object: arquivo armazenado.
+- Key: identificador unico do objeto dentro do bucket.
+- Content-Type: tipo MIME do objeto, como `text/plain` ou `image/png`.
+
+No projeto, o bucket configurado e:
+
+```text
+pixel-files
+```
+
+### boto3
+
+`boto3` e a biblioteca oficial da AWS para Python.
+
+Mesmo usando MinIO, utilizamos `boto3` porque MinIO entende a API S3.
+
+No arquivo `backend/storage.py`, criamos clientes S3:
+
+```python
+minio_client = create_minio_client(settings.minio_endpoint)
+public_minio_client = create_minio_client(settings.minio_public_endpoint)
+```
+
+Existem dois clientes por um motivo pratico:
+
+- `minio_client`: usado dentro da rede Docker, apontando para `minio:9000`.
+- `public_minio_client`: usado para gerar links que o navegador da maquina host consiga abrir, apontando para `localhost:9000`.
+
+Dentro do container backend, `minio:9000` funciona porque `minio` e o nome do servico na rede Docker.
+
+Fora do Docker, no navegador, `minio:9000` nao resolve. Por isso presigned URLs precisam usar `localhost:9000`.
+
+### Dependency Injection do FastAPI para MinIO
+
+No `storage.py`, tambem criamos dependencias:
+
+```python
+def get_minio():
+    return minio_client
+```
+
+e:
+
+```python
+MinioClient = Annotated[object, Depends(get_minio)]
+```
+
+Isso permite declarar nas rotas:
+
+```python
+storage: MinioClient
+```
+
+O FastAPI injeta o cliente automaticamente.
+
+Esse mesmo padrao ja tinha sido usado com banco de dados e usuario autenticado.
+
+### Router de arquivos
+
+As rotas de arquivos ficam em:
+
+```text
+backend/routers/files.py
+```
+
+Foi criado:
+
+```python
+router = APIRouter(tags=["files"])
+```
+
+Como nao ha `prefix`, as rotas seguem exatamente o plano:
+
+- `POST /upload`
+- `GET /download/{file_id}`
+- `GET /share/{file_id}`
+
+Todas essas rotas exigem autenticacao.
+
+### Autenticacao nas rotas de arquivos
+
+No router de arquivos, foi criado:
+
+```python
+CurrentUser = Annotated[User, Depends(get_current_user)]
+```
+
+Cada rota recebe:
+
+```python
+current_user: CurrentUser
+```
+
+Isso significa que:
+
+1. a requisicao precisa enviar header `Authorization`;
+2. o token precisa ser valido;
+3. o usuario precisa existir no banco;
+4. a rota recebe o objeto `User` autenticado.
+
+Esse padrao garante isolamento por usuario.
+
+### Validacao de tipo de arquivo
+
+O projeto aceita apenas:
+
+```text
+.png
+.jpg
+.pdf
+.txt
+```
+
+Essa regra foi implementada com:
+
+```python
+ALLOWED_EXTENSIONS = {".png", ".jpg", ".pdf", ".txt"}
+```
+
+Tambem validamos o MIME type esperado:
+
+```python
+ALLOWED_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+}
+```
+
+Extensao e MIME type sao coisas diferentes:
+
+- extensao e o final do nome do arquivo, como `.pdf`;
+- MIME type e o tipo declarado do conteudo, como `application/pdf`.
+
+Validar os dois reduz erros acidentais e alguns abusos simples.
+
+### Sanitizacao do nome do arquivo
+
+O nome do arquivo enviado pelo usuario passa por:
+
+```python
+Path(filename).name.strip()
+```
+
+Isso remove caminhos e mantem apenas o nome final.
+
+Exemplo:
+
+```text
+../../segredo.txt
+```
+
+vira:
+
+```text
+segredo.txt
+```
+
+Esse cuidado evita que nomes de arquivos sejam tratados como caminhos.
+
+### Limite de 10MB
+
+O limite foi definido assim:
+
+```python
+MAX_FILE_SIZE = 10 * 1024 * 1024
+```
+
+Isso equivale a 10 megabytes em bytes.
+
+Durante a leitura do upload, somamos o tamanho dos chunks:
+
+```python
+total_size += len(chunk)
+```
+
+Se passar de 10MB, a API retorna:
+
+```text
+413 Request Entity Too Large
+```
+
+### Upload em chunks
+
+Chunk e um pedaco do arquivo.
+
+Em vez de chamar uma leitura unica do arquivo inteiro, o backend le partes:
+
+```python
+CHUNK_SIZE = 1024 * 1024
+```
+
+Ou seja, 1MB por vez.
+
+Fluxo:
+
+1. cria um `BytesIO`;
+2. le 1MB do upload;
+3. soma no tamanho total;
+4. verifica se passou de 10MB;
+5. escreve o chunk no buffer;
+6. repete ate o arquivo acabar;
+7. volta o ponteiro do buffer para o inicio com `seek(0)`.
+
+`BytesIO` e um arquivo em memoria. Como o limite e 10MB, manter esse buffer em memoria e aceitavel nesta etapa e evita gravar arquivo no filesystem local do backend.
+
+### upload_fileobj
+
+Depois de ler e validar o arquivo, usamos:
+
+```python
+storage.upload_fileobj(
+    file_buffer,
+    settings.minio_bucket,
+    minio_key,
+    ExtraArgs={"ContentType": mime_type},
+)
+```
+
+`upload_fileobj` envia um objeto semelhante a arquivo para o S3/MinIO.
+
+Parametros:
+
+- `file_buffer`: conteudo do arquivo.
+- `settings.minio_bucket`: nome do bucket.
+- `minio_key`: chave do objeto.
+- `ExtraArgs`: metadados extras, como `ContentType`.
+
+### Geracao da minio_key
+
+A chave do objeto e gerada assim:
+
+```python
+minio_key = f"users/{current_user.id}/{uuid4().hex}_v{version}{extension}"
+```
+
+Exemplo:
+
+```text
+users/abc-123/0f9c..._v2.txt
+```
+
+Essa estrutura ajuda a:
+
+- separar arquivos por usuario;
+- evitar colisao de nomes com UUID;
+- manter a versao visivel na chave;
+- preservar a extensao original.
+
+Mesmo que dois usuarios enviem `contrato.pdf`, as chaves serao diferentes.
+
+### Versionamento
+
+Versionamento significa manter historico quando o usuario envia um arquivo com o mesmo nome.
+
+Exemplo:
+
+```text
+contrato.pdf -> version 1
+contrato.pdf -> version 2
+contrato.pdf -> version 3
+```
+
+Para calcular a proxima versao:
+
+```python
+select(func.max(FileModel.version)).where(
+    FileModel.user_id == user_id,
+    FileModel.original_name == original_name,
+)
+```
+
+Ou seja:
+
+1. procura a maior versao daquele nome para aquele usuario;
+2. se nao existir, comeca em 1;
+3. se existir, soma 1.
+
+Isso e feito por usuario. Arquivos de usuarios diferentes nao interferem entre si.
+
+### Registro no PostgreSQL
+
+Depois que o arquivo e enviado ao MinIO, criamos o registro:
+
+```python
+stored_file = FileModel(
+    user_id=current_user.id,
+    original_name=original_name,
+    minio_key=minio_key,
+    mime_type=mime_type,
+    size=total_size,
+    version=version,
+)
+```
+
+O PostgreSQL guarda os metadados.
+
+Campos importantes:
+
+- `user_id`: dono do arquivo.
+- `original_name`: nome que o usuario enviou.
+- `minio_key`: onde esta o arquivo no MinIO.
+- `mime_type`: tipo do arquivo.
+- `size`: tamanho em bytes.
+- `version`: versao calculada.
+
+### Ordem upload -> DB
+
+Neste passo, o fluxo escolhido foi:
+
+1. enviar arquivo para MinIO;
+2. salvar metadados no banco.
+
+Se o upload para MinIO falha, nada e salvo no banco.
+
+Se o upload funciona mas o banco falha, tentamos remover o objeto do MinIO:
+
+```python
+storage.delete_object(Bucket=settings.minio_bucket, Key=minio_key)
+```
+
+Isso reduz o risco de deixar arquivo orfao no storage.
+
+Arquivo orfao seria um arquivo existente no MinIO sem registro correspondente no PostgreSQL.
+
+### Schema FileRead
+
+Foi criado em `schemas.py`:
+
+```python
+class FileRead(BaseModel):
+    id: str
+    original_name: str
+    mime_type: str
+    size: int
+    version: int
+    created_at: datetime
+```
+
+Esse schema define a resposta do upload.
+
+Ele nao retorna `minio_key`, porque essa chave e detalhe interno do backend. O usuario nao precisa saber como o arquivo esta salvo no storage.
+
+### Download com StreamingResponse
+
+Download foi implementado com:
+
+```python
+@router.get("/download/{file_id}")
+```
+
+Primeiro, a API busca o arquivo garantindo que:
+
+- o `id` bate;
+- o `user_id` e do usuario autenticado;
+- `is_deleted` e falso.
+
+Depois, busca o objeto no MinIO:
+
+```python
+storage.get_object(Bucket=settings.minio_bucket, Key=stored_file.minio_key)
+```
+
+O retorno do MinIO contem um corpo de streaming.
+
+Para responder ao cliente, usamos:
+
+```python
+StreamingResponse(...)
+```
+
+StreamingResponse permite enviar o arquivo em pedacos, sem carregar tudo na resposta de uma vez.
+
+### Por que streaming importa
+
+Streaming e importante porque arquivos podem ser grandes.
+
+Sem streaming:
+
+1. backend baixa o arquivo inteiro do MinIO;
+2. guarda tudo em memoria;
+3. so depois responde ao cliente.
+
+Com streaming:
+
+1. backend pega um chunk do MinIO;
+2. envia esse chunk ao cliente;
+3. repete ate acabar.
+
+Isso usa menos memoria e escala melhor.
+
+Mesmo com limite de 10MB, usar streaming desde cedo e bom porque o projeto tem esse bonus como requisito.
+
+### Content-Disposition
+
+No download, adicionamos header:
+
+```python
+Content-Disposition: attachment
+```
+
+Esse header orienta o navegador a baixar o arquivo como anexo.
+
+Tambem usamos o nome original:
+
+```python
+filename*=UTF-8''{encoded_name}
+```
+
+`quote()` codifica caracteres especiais para evitar problemas em headers HTTP.
+
+### Presigned URL
+
+Presigned URL e um link temporario assinado.
+
+Ele permite que alguem baixe um objeto diretamente do MinIO sem passar pela API, mas somente ate expirar.
+
+Rota:
+
+```text
+GET /share/{file_id}
+```
+
+Parametro opcional:
+
+```text
+expires_minutes
+```
+
+Valor padrao:
+
+```text
+15 minutos
+```
+
+Limites:
+
+```text
+minimo: 1 minuto
+maximo: 60 minutos
+```
+
+O codigo usa:
+
+```python
+generate_presigned_url(
+    "get_object",
+    Params={"Bucket": settings.minio_bucket, "Key": stored_file.minio_key},
+    ExpiresIn=expires_in,
+)
+```
+
+### Seguranca do share
+
+Mesmo que a URL gerada permita baixar direto do MinIO, a geracao dela ainda e protegida.
+
+Ou seja:
+
+1. o usuario precisa estar autenticado;
+2. o arquivo precisa pertencer ao usuario;
+3. so entao a API gera o link.
+
+Assim, um usuario nao consegue gerar link para arquivo de outro usuario.
+
+### Schema ShareLink
+
+Foi criado:
+
+```python
+class ShareLink(BaseModel):
+    url: str
+    expires_in: int
+```
+
+Resposta esperada:
+
+```json
+{
+  "url": "http://localhost:9000/...",
+  "expires_in": 900
+}
+```
+
+`expires_in` fica em segundos.
+
+### Erros previstos neste passo
+
+Possiveis respostas:
+
+- `201 Created`: upload feito com sucesso.
+- `400 Bad Request`: extensao invalida, MIME type invalido ou arquivo vazio.
+- `401 Unauthorized`: token ausente ou invalido.
+- `404 Not Found`: arquivo nao existe ou nao pertence ao usuario.
+- `413 Request Entity Too Large`: arquivo maior que 10MB.
+- `422 Validation Error`: parametro/formulario invalido.
+- `502 Bad Gateway`: falha ao comunicar com MinIO.
+
+### Como testar o Passo 3 pelo Swagger
+
+Subir servicos:
+
+```bash
+docker compose up -d --build postgres redis minio backend
+```
+
+Abrir Swagger:
+
+```text
+http://localhost:8000/docs
+```
+
+Fazer login:
+
+```text
+POST /auth/login
+```
+
+Copiar o `access_token`.
+
+Clicar em `Authorize` e preencher:
+
+```text
+Bearer SEU_TOKEN
+```
+
+Fazer upload:
+
+```text
+POST /upload
+```
+
+Selecionar um arquivo `.txt`, `.png`, `.jpg` ou `.pdf`.
+
+Resposta esperada:
+
+```json
+{
+  "id": "...",
+  "original_name": "arquivo.txt",
+  "mime_type": "text/plain",
+  "size": 123,
+  "version": 1,
+  "created_at": "..."
+}
+```
+
+Enviar o mesmo arquivo novamente.
+
+Resultado esperado:
+
+```json
+{
+  "version": 2
+}
+```
+
+Baixar arquivo:
+
+```text
+GET /download/{file_id}
+```
+
+Gerar link temporario:
+
+```text
+GET /share/{file_id}?expires_minutes=15
+```
+
+Copiar o campo `url` e abrir no navegador.
+
+### Como verificar no MinIO
+
+Abrir:
+
+```text
+http://localhost:9001
+```
+
+Login:
+
+```text
+minioadmin
+```
+
+Senha:
+
+```text
+minioadmin
+```
+
+Entrar no bucket:
+
+```text
+pixel-files
+```
+
+Verificar se existem objetos com estrutura parecida com:
+
+```text
+users/{user_id}/{uuid}_v1.txt
+users/{user_id}/{uuid}_v2.txt
+```
+
+### Como verificar no banco
+
+Opcionalmente, entrar no Postgres:
+
+```bash
+docker compose exec postgres psql -U pixel -d pixel_breeders
+```
+
+Consultar arquivos:
+
+```sql
+SELECT id, user_id, original_name, minio_key, mime_type, size, version, is_deleted, created_at
+FROM files
+ORDER BY created_at DESC;
+```
+
+O mesmo arquivo enviado duas vezes pelo mesmo usuario deve aparecer com versoes diferentes.
+
+### Cuidados importantes
+
+O Passo 3 ainda nao tem listagem `GET /files`.
+
+Isso e intencional. Listagem, cache Redis e delecao pertencem ao Passo 4.
+
+Mesmo sem listagem, o Passo 3 e testavel isoladamente pelo Swagger porque `POST /upload` retorna o `id` do arquivo, e esse `id` pode ser usado em:
+
+- `GET /download/{file_id}`
+- `GET /share/{file_id}`

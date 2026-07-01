@@ -1,8 +1,4 @@
-from typing import Annotated
-
-import boto3
-from botocore.client import Config
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -10,17 +6,10 @@ from config import get_settings
 from database import Base, DbSession, RedisClient, engine
 import models
 from routers.auth import router as auth_router
+from routers.files import router as files_router
+from storage import MinioClient, minio_client
 
 settings = get_settings()
-
-minio_client = boto3.client(
-    "s3",
-    endpoint_url=f"{'https' if settings.minio_secure else 'http'}://{settings.minio_endpoint}",
-    aws_access_key_id=settings.minio_access_key,
-    aws_secret_access_key=settings.minio_secret_key,
-    config=Config(signature_version="s3v4"),
-    region_name="us-east-1",
-)
 
 app = FastAPI(
     title="Pixel Breeders File Manager API",
@@ -37,13 +26,8 @@ app.add_middleware(
 )
 
 
-def get_minio():
-    return minio_client
-
-
-MinioClient = Annotated[object, Depends(get_minio)]
-
 app.include_router(auth_router)
+app.include_router(files_router)
 
 
 @app.get("/")

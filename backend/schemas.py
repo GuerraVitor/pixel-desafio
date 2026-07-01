@@ -25,3 +25,19 @@ class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserRead
+
+
+class FileRead(BaseModel):
+    id: str
+    original_name: str
+    mime_type: str
+    size: int
+    version: int
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ShareLink(BaseModel):
+    url: str
+    expires_in: int
