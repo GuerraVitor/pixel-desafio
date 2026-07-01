@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -10,6 +12,7 @@ from routers.files import router as files_router
 from storage import MinioClient, minio_client
 
 settings = get_settings()
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="Pixel Breeders File Manager API",

@@ -1,3 +1,5 @@
+import json
+import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated
@@ -11,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from config import get_settings
-from database import DbSession
+from database import DbSession, RedisClient
 from models import File as FileModel
 from models import User
 from schemas import FileRead, ShareLink
@@ -21,6 +23,7 @@ from storage import MinioClient, PublicMinioClient
 
 router = APIRouter(tags=["files"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -32,6 +35,15 @@ ALLOWED_MIME_TYPES = {
     ".pdf": "application/pdf",
     ".txt": "text/plain",
 }
+CACHE_TTL_SECONDS = 60 * 5
+
+
+def files_cache_key(user_id: str) -> str:
+    return f"files:user:{user_id}"
+
+
+def invalidate_files_cache(cache: RedisClient, user_id: str) -> None:
+    cache.delete(files_cache_key(user_id))
 
 
 def sanitize_filename(filename: str) -> str:
@@ -100,6 +112,35 @@ def get_owned_file(db: DbSession, current_user: User, file_id: str) -> FileModel
     return stored_file
 
 
+def serialize_file(stored_file: FileModel) -> dict:
+    return FileRead.model_validate(stored_file).model_dump(mode="json")
+
+
+def get_latest_active_files(db: DbSession, user_id: str) -> list[FileModel]:
+    latest_versions = (
+        select(
+            FileModel.original_name.label("original_name"),
+            func.max(FileModel.version).label("latest_version"),
+        )
+        .where(FileModel.user_id == user_id, FileModel.is_deleted.is_(False))
+        .group_by(FileModel.original_name)
+        .subquery()
+    )
+
+    return list(
+        db.scalars(
+            select(FileModel)
+            .join(
+                latest_versions,
+                (FileModel.original_name == latest_versions.c.original_name)
+                & (FileModel.version == latest_versions.c.latest_version),
+            )
+            .where(FileModel.user_id == user_id, FileModel.is_deleted.is_(False))
+            .order_by(FileModel.created_at.desc())
+        )
+    )
+
+
 def stream_minio_body(body):
     try:
         for chunk in body.iter_chunks(chunk_size=CHUNK_SIZE):
@@ -113,6 +154,7 @@ def stream_minio_body(body):
 async def upload_file(
     current_user: CurrentUser,
     db: DbSession,
+    cache: RedisClient,
     storage: MinioClient,
     file: UploadFile = UploadField(...),
 ) -> FileModel:
@@ -155,7 +197,27 @@ async def upload_file(
         ) from exc
 
     db.refresh(stored_file)
+    invalidate_files_cache(cache, current_user.id)
     return stored_file
+
+
+@router.get("/files", response_model=list[FileRead])
+def list_files(
+    current_user: CurrentUser,
+    db: DbSession,
+    cache: RedisClient,
+) -> list[dict]:
+    cache_key = files_cache_key(current_user.id)
+    cached_files = cache.get(cache_key)
+
+    if cached_files is not None:
+        logger.info("GET /files cache hit for user %s", current_user.id)
+        return json.loads(cached_files)
+
+    logger.info("GET /files cache miss for user %s", current_user.id)
+    files = [serialize_file(stored_file) for stored_file in get_latest_active_files(db, current_user.id)]
+    cache.setex(cache_key, CACHE_TTL_SECONDS, json.dumps(files))
+    return files
 
 
 @router.get("/download/{file_id}")
@@ -208,3 +270,34 @@ def share_file(
         ) from exc
 
     return ShareLink(url=url, expires_in=expires_in)
+
+
+@router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_file(
+    file_id: str,
+    current_user: CurrentUser,
+    db: DbSession,
+    cache: RedisClient,
+    storage: MinioClient,
+) -> None:
+    stored_file = get_owned_file(db, current_user, file_id)
+
+    try:
+        storage.delete_object(Bucket=settings.minio_bucket, Key=stored_file.minio_key)
+    except ClientError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not delete file from storage",
+        ) from exc
+
+    stored_file.is_deleted = True
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not delete file metadata",
+        ) from exc
+
+    invalidate_files_cache(cache, current_user.id)
