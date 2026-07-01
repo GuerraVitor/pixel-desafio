@@ -332,7 +332,7 @@ KEYS files:user:*
 
 ## Uso de IA
 
-Ferramentas de IA foram usadas de forma relevante durante o desenvolvimento para auxiliar na estruturacao incremental do projeto, revisao de erros, geracao de codigo inicial, documentacao e explicacao das decisoes tecnicas. O arquivo `notes.md` foi mantido como material de estudo, com explicacoes teoricas e praticas sobre a arquitetura, bibliotecas, fluxos e conceitos usados na aplicacao.
+Ferramentas de IA foram usadas de forma relevante durante o desenvolvimento para auxiliar na estruturacao incremental do projeto, revisao de erros, geracao de codigo inicial, documentacao e explicacao das decisoes tecnicas.
 
 ## Status geral
 
